@@ -7,6 +7,52 @@ use napi::bindgen_prelude::*;
 #[macro_use]
 extern crate napi_derive;
 
+/// Maximum number of times to double the output buffer before giving up.
+const MAX_DECODE_RETRIES: u32 = 8;
+
+/// Cap the output buffer at 64 MB to prevent runaway allocations.
+const MAX_DECODE_BUFFER: usize = 64 * 1024 * 1024;
+
+/// Calculate the initial encode output buffer size.
+/// Encoding generally produces output smaller than input, but we need
+/// headroom for incompressible data where heatshrink may expand slightly.
+fn encode_buffer_size(input_len: usize) -> usize {
+  // At minimum 1 KB, otherwise 2x input to handle worst-case expansion
+  (input_len * 2).max(1024)
+}
+
+/// Calculate the initial decode output buffer size.
+/// Heatshrink-compressed data can expand significantly (10x+ for highly
+/// compressible inputs like log files), so we start with a generous 4x.
+fn decode_buffer_size(input_len: usize) -> usize {
+  // At minimum 4 KB, otherwise 4x input as a reasonable starting point
+  (input_len * 4).max(4096)
+}
+
+/// Attempt to decode with progressively larger buffers.
+/// Starts at `initial_size` and doubles up to MAX_DECODE_RETRIES times,
+/// capped at MAX_DECODE_BUFFER.
+fn decode_with_retry(input: &[u8], initial_size: usize, config: &Config) -> std::result::Result<Vec<u8>, String> {
+  let mut buf_size = initial_size;
+  for _ in 0..MAX_DECODE_RETRIES {
+    let mut output_buf: Vec<u8> = vec![0; buf_size];
+    match heatshrink::decode(input, output_buf.as_mut_slice(), config) {
+      Ok(out) => return Ok(Vec::from(out)),
+      Err(_) => {
+        buf_size *= 2;
+        if buf_size > MAX_DECODE_BUFFER {
+          break;
+        }
+      }
+    }
+  }
+  Err(format!(
+    "Output buffer exhausted after retries (last attempt: {} bytes, input: {} bytes)",
+    buf_size.min(MAX_DECODE_BUFFER),
+    input.len()
+  ))
+}
+
 #[napi]
 pub fn encode_sync(input: Buffer, window_size: u8, lookahead_size: u8) -> Result<Buffer> {
   let input_ref: &[u8] = input.as_ref();
@@ -17,15 +63,13 @@ pub fn encode_sync(input: Buffer, window_size: u8, lookahead_size: u8) -> Result
     }
   };
 
-  let mut output_buf: Vec<u8> = vec![0; 16 + (2 * (2 ^ input.len()))];
+  let mut output_buf: Vec<u8> = vec![0; encode_buffer_size(input.len())];
   match heatshrink::encode(input_ref, output_buf.as_mut_slice(), &config) {
-    Ok(out) => {
-      return Ok(Vec::from(out).into());
-    },
+    Ok(out) => Ok(Vec::from(out).into()),
     Err(err) => {
-      return Err(Error::new(Status::GenericFailure, format!("{:?}", err)));
+      Err(Error::new(Status::GenericFailure, format!("{:?}", err)))
     }
-  };
+  }
 }
 
 #[napi]
@@ -38,17 +82,14 @@ pub fn decode_sync(input: Buffer, window_size: u8, lookahead_size: u8, output_bu
     }
   };
 
-  let initial_buffer_size = output_buffer_size.unwrap_or((16 + (2 * (2 ^ input.len()))) as u32) as usize;
-  let mut output_buf: Vec<u8> = vec![0; initial_buffer_size];
+  let initial_size = output_buffer_size
+    .map(|s| s as usize)
+    .unwrap_or_else(|| decode_buffer_size(input.len()));
 
-  match heatshrink::decode(input_ref, output_buf.as_mut_slice(), &config) {
-    Ok(out) => {
-      return Ok(Vec::from(out).into());
-    },
-    Err(err) => {
-      return Err(Error::new(Status::GenericFailure, format!("{:?}", err)));
-    }
-  };
+  match decode_with_retry(input_ref, initial_size, &config) {
+    Ok(out) => Ok(out.into()),
+    Err(msg) => Err(Error::new(Status::GenericFailure, msg)),
+  }
 }
 
 pub struct EncodeTask {
@@ -69,16 +110,14 @@ impl Task for EncodeTask {
         return Err(Error::new(Status::GenericFailure, err));
       }
     };
-  
-    let mut output_buf: Vec<u8> = vec![0; 16 + (2 * (2 ^ self.input.len()))];
+
+    let mut output_buf: Vec<u8> = vec![0; encode_buffer_size(self.input.len())];
     match heatshrink::encode(input_ref, output_buf.as_mut_slice(), &config) {
-      Ok(out) => {
-        return Ok(Vec::from(out));
-      },
+      Ok(out) => Ok(Vec::from(out)),
       Err(err) => {
-        return Err(Error::new(Status::GenericFailure, format!("{:?}", err)));
+        Err(Error::new(Status::GenericFailure, format!("{:?}", err)))
       }
-    };
+    }
   }
 
   fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -106,17 +145,14 @@ impl Task for DecodeTask {
       }
     };
 
-    let initial_buffer_size = self.output_buffer_size.unwrap_or((16 + (2 * (2 ^ self.input.len()))) as u32) as usize;
-    let mut output_buf: Vec<u8> = vec![0; initial_buffer_size];
+    let initial_size = self.output_buffer_size
+      .map(|s| s as usize)
+      .unwrap_or_else(|| decode_buffer_size(self.input.len()));
 
-    match heatshrink::decode(input_ref, output_buf.as_mut_slice(), &config) {
-      Ok(out) => {
-        return Ok(Vec::from(out));
-      },
-      Err(err) => {
-        return Err(Error::new(Status::GenericFailure, format!("{:?}", err)));
-      }
-    };
+    match decode_with_retry(input_ref, initial_size, &config) {
+      Ok(out) => Ok(out),
+      Err(msg) => Err(Error::new(Status::GenericFailure, msg)),
+    }
   }
 
   fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
